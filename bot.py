@@ -2,7 +2,7 @@ import requests
 import json
 import time
 import logging
-import sqlite3
+import psycopg2  # CHANGED: Use psycopg2 for Postgres
 from datetime import datetime
 import google.generativeai as genai
 import os
@@ -12,20 +12,22 @@ import asyncio
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
 from telegram import Update
 from telegram.ext import ContextTypes
-from requests.exceptions import HTTPError  # NEW: Added for rate limiting
+from requests.exceptions import HTTPError
 
-# Configure logging
+# CHANGED: Use only StreamHandler for logging (Heroku's filesystem is ephemeral)
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[logging.FileHandler('/data/baxus_scraper.log'), logging.StreamHandler()]  # CHANGED: Log to /data
+    handlers=[logging.StreamHandler()]
 )
+# NEW: Warn about Heroku ephemeral filesystem
+logging.warning("Running on Heroku: Database must use Postgres; JSON files will be lost on dyno restart.")
 
-# NEW: Load environment variables
+# Load environment variables
 TOKEN = os.getenv("TOKEN")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
-# NEW: Validate environment variables
+# Validate environment variables
 if not TOKEN or not GOOGLE_API_KEY:
     logging.error("Missing TOKEN or GOOGLE_API_KEY environment variables")
     exit(1)
@@ -50,7 +52,6 @@ def fetch_listings():
         logging.info(f"Fetching listings: {url}")
         try:
             response = requests.get(url, headers=headers, timeout=10)
-            # NEW: Handle rate limiting (HTTP 429)
             if response.status_code == 429:
                 logging.warning("Rate limit hit, sleeping for 60 seconds")
                 time.sleep(60)
@@ -85,7 +86,7 @@ def fetch_listings():
             logging.debug(f"Possible ID fields: {possible_ids}")
             
             listing_id = source.get('id') or source.get('nftAddress') or item.get('_id')
-            if listing_id is None:
+ אם listing_id הוא None:
                 logging.warning(f"Missing ID for listing: {json.dumps(item, indent=2)}")
                 listing_id = str(hash(json.dumps(item, sort_keys=True)))
             logging.debug(f"Processing listing ID: {listing_id}")
@@ -123,21 +124,27 @@ def fetch_listings():
         from_idx += size
         time.sleep(1)
 
-    # CHANGED: Save JSON files to /data
-    raw_json_file = f"/data/raw_json_{timestamp}.json"
-    with open(raw_json_file, 'w', encoding='utf-8') as f:
-        json.dump(raw_listings, f, indent=2)
-    logging.info(f"Raw JSON saved to {raw_json_file}")
+    # CHANGED: Save JSON files to current directory (ephemeral)
+    raw_json_file = f"raw_json_{timestamp}.json"
+    try:
+        with open(raw_json_file, 'w', encoding='utf-8') as f:
+            json.dump(raw_listings, f, indent=2)
+        logging.info(f"Raw JSON saved to {raw_json_file}")
+    except IOError as e:
+        logging.error(f"Error saving raw JSON: {e}")
 
-    output_file = f"/data/baxus_listings_{timestamp}.json"
-    with open(output_file, 'w', encoding='utf-8') as f:
-        json.dump(all_listings, f, indent=2)
-    logging.info(f"Saved {len(all_listings)} listings to {output_file}")
+    output_file = f"baxus_listings_{timestamp}.json"
+    try:
+        with open(output_file, 'w', encoding='utf-8') as f:
+            json.dump(all_listings, f, indent=2)
+        logging.info(f"Saved {len(all_listings)} listings to {output_file}")
+    except IOError as e:
+        logging.error(f"Error saving listings JSON: {e}")
     return all_listings
 
-# Database
-def store_in_db(listings, db_file='/data/baxus.db'):  # CHANGED: Default to /data/baxus.db
-    conn = sqlite3.connect(db_file)
+# Database (Postgres)
+def store_in_db(listings, db_url=os.getenv("DATABASE_URL")):  # CHANGED: Use Postgres via DATABASE_URL
+    conn = psycopg2.connect(db_url)
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS listings (
         id TEXT PRIMARY KEY, name TEXT, description TEXT, price REAL,
@@ -150,14 +157,20 @@ def store_in_db(listings, db_file='/data/baxus.db'):  # CHANGED: Default to /dat
             logging.warning(f"Skipping invalid listing {listing['id']}: {listing}")
             continue
         try:
-            c.execute('INSERT OR REPLACE INTO listings VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            c.execute('INSERT INTO listings (id, name, description, price, spirit_type, listed_date, attributes, image_url, status, producer, volume, Age, ABV, Size) '
+                      'VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) '
+                      'ON CONFLICT (id) DO UPDATE SET '
+                      'name = EXCLUDED.name, description = EXCLUDED.description, price = EXCLUDED.price, '
+                      'spirit_type = EXCLUDED.spirit_type, listed_date = EXCLUDED.listed_date, attributes = EXCLUDED.attributes, '
+                      'image_url = EXCLUDED.image_url, status = EXCLUDED.status, producer = EXCLUDED.producer, '
+                      'volume = EXCLUDED.volume, Age = EXCLUDED.Age, ABV = EXCLUDED.ABV, Size = EXCLUDED.Size',
                       (listing['id'], listing['name'], listing['description'], listing['price'],
                        listing['spirit_type'], listing['listed_date'], json.dumps(listing['attributes']),
                        listing['image_url'], listing['status'], listing['producer'],
                        listing['volume'], listing['Age'], listing['ABV'], listing['Size']))
             logging.debug(f"Stored listing: {listing['name']} (ID: {listing['id']})")
             valid_listings += 1
-        except sqlite3.Error as e:
+        except psycopg2.Error as e:
             logging.error(f"Error storing listing {listing['id']}: {e}")
     conn.commit()
     c.execute("SELECT COUNT(*) FROM listings")
@@ -165,8 +178,8 @@ def store_in_db(listings, db_file='/data/baxus.db'):  # CHANGED: Default to /dat
     logging.info(f"Stored {valid_listings} valid listings. Database contains {count} listings.")
     conn.close()
 
-def get_db_summary(db_file='/data/baxus.db'):  # CHANGED: Default to /data/baxus.db
-    conn = sqlite3.connect(db_file)
+def get_db_summary(db_url=os.getenv("DATABASE_URL")):  # CHANGED: Use Postgres
+    conn = psycopg2.connect(db_url)
     c = conn.cursor()
     
     try:
@@ -185,10 +198,10 @@ def get_db_summary(db_file='/data/baxus.db'):  # CHANGED: Default to /data/baxus
         c.execute("SELECT producer, COUNT(*) as cnt FROM listings WHERE producer != '' GROUP BY producer ORDER BY cnt DESC LIMIT 5")
         top_producers = [row[0] for row in c.fetchall()]
         
-        c.execute("SELECT DISTINCT json_extract(attributes, '$.Country') FROM listings WHERE json_extract(attributes, '$.Country') IS NOT NULL")
+        c.execute("SELECT DISTINCT CAST(attributes->>'Country' AS TEXT) FROM listings WHERE attributes->>'Country' IS NOT NULL")
         countries = [row[0] for row in c.fetchall()]
         
-        c.execute("SELECT DISTINCT json_extract(attributes, '$.Region') FROM listings WHERE json_extract(attributes, '$.Region') IS NOT NULL")
+        c.execute("SELECT DISTINCT CAST(attributes->>'Region' AS TEXT) FROM listings WHERE attributes->>'Region' IS NOT NULL")
         regions = [row[0] for row in c.fetchall()]
         
         summary = {
@@ -201,7 +214,7 @@ def get_db_summary(db_file='/data/baxus.db'):  # CHANGED: Default to /data/baxus
             'price_range': {'min': float(min_price or 0), 'max': float(max_price or 10000)},
             'total_listings': int(count or 0)
         }
-    except sqlite3.Error as e:
+    except psycopg2.Error as e:
         logging.error(f"Error getting db summary: {e}")
         summary = {
             'spirit_types': ['Whisky', 'Bourbon', 'Scotch'],
@@ -218,7 +231,6 @@ def get_db_summary(db_file='/data/baxus.db'):  # CHANGED: Default to /data/baxus
     return summary
 
 # Bot
-# CHANGED: Use environment variable for Google API key
 async def parse_query_with_gemini(query: str) -> dict:
     genai.configure(api_key=GOOGLE_API_KEY)
     model = genai.GenerativeModel('gemini-1.5-flash')
@@ -262,11 +274,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def list_listings(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    conn = sqlite3.connect('/data/baxus.db')  # CHANGED: Use /data/baxus.db
+    conn = psycopg2.connect(os.getenv("DATABASE_URL"))  # CHANGED: Use Postgres
     c = conn.cursor()
     try:
         c.execute("SELECT name, price, spirit_type, id, producer, volume, Age, ABV, Size FROM listings ORDER BY RANDOM() LIMIT 5")
-        listings = c.fetchall()
+        listings | c.fetchall()
         logging.debug(f"Fetched {len(listings)} listings for /list")
         if not listings:
             await update.message.reply_text("No listings available. The database may be empty. Try again later.")
@@ -283,7 +295,7 @@ async def list_listings(update: Update, context: ContextTypes.DEFAULT_TYPE):
             Size = f"{Size}" if Size else "Unknown Size"
             response.append(f"{name} - {price} ({spirit_type}) by {producer}, {volume}, Age: {Age}, ABV: {ABV}, Size: {Size} - https://baxus.co/asset/{id}")
         await update.message.reply_text("\n".join(response))
-    except sqlite3.Error as e:
+    except psycopg2.Error as e:
         logging.error(f"Database error in list_listings: {e}")
         await update.message.reply_text("Error accessing the database. Please try again later.")
     finally:
@@ -353,7 +365,7 @@ async def search_listings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text_query = ' '.join(text_query.split()) if text_query else ''
 
     try:
-        conn = sqlite3.connect('/data/baxus.db')  # CHANGED: Use /data/baxus.db
+        conn = psycopg2.connect(os.getenv("DATABASE_URL"))  # CHANGED: Use Postgres
         c = conn.cursor()
         sql = "SELECT name, price, spirit_type, id, producer, volume, Age, ABV, Size FROM listings WHERE 1=1"
         conditions = []
@@ -361,23 +373,23 @@ async def search_listings(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Add text search conditions
         if text_query and not (price_min or price_max or age_min or age_max):
-            conditions.append("(lower(name) LIKE ? OR lower(description) LIKE ?)")
+            conditions.append("(LOWER(name) LIKE %s OR LOWER(description) LIKE %s)")
             query_params.extend([f"%{text_query}%", f"%{text_query}%"])
 
         # Add price range conditions
         if price_min is not None:
-            conditions.append("price >= ?")
+            conditions.append("price >= %s")
             query_params.append(price_min)
         if price_max is not None:
-            conditions.append("price <= ?")
+            conditions.append("price <= %s")
             query_params.append(price_max)
 
         # Add age range conditions
         if age_min is not None:
-            conditions.append("CAST(Age AS INTEGER) >= ?")
+            conditions.append("CAST(Age AS INTEGER) >= %s")
             query_params.append(age_min)
         if age_max is not None:
-            conditions.append("CAST(Age AS INTEGER) <= ?")
+            conditions.append("CAST(Age AS INTEGER) <= %s")
             query_params.append(age_max)
 
         # Build SQL query
@@ -406,7 +418,7 @@ async def search_listings(update: Update, context: ContextTypes.DEFAULT_TYPE):
             Size = f"{Size}ml" if Size else "Unknown Size"
             response.append(f"{name} - {price} ({spirit_type}) by {producer}, {volume}, Age: {Age}, ABV: {ABV}, Size: {Size} - https://baxus.co/asset/{id}")
         await update.message.reply_text("\n".join(response))
-    except sqlite3.Error as e:
+    except psycopg2.Error as e:
         logging.error(f"Database error in search_listings: {e}")
         await update.message.reply_text("Error accessing the database. Please try again later.")
     finally:
@@ -417,11 +429,11 @@ async def filter_by_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not spirit_type:
         await update.message.reply_text("Please provide a spirit type, e.g., /type Whisky")
         return
-    conn = sqlite3.connect('/data/baxus.db')  # CHANGED: Use /data/baxus.db
+    conn = psycopg2.connect(os.getenv("DATABASE_URL"))  # CHANGED: Use Postgres
     c = conn.cursor()
     try:
         c.execute("SELECT name, price, spirit_type, id, producer, volume, Age, ABV, Size FROM listings "
-                  "WHERE lower(spirit_type) LIKE ? LIMIT 5", (f"%{spirit_type}%",))
+                  "WHERE LOWER(spirit_type) LIKE %s LIMIT 5", (f"%{spirit_type}%",))
         listings = c.fetchall()
         logging.debug(f"Fetched {len(listings)} listings for /type {spirit_type}")
         if not listings:
@@ -439,7 +451,7 @@ async def filter_by_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
             Size = f"{Size}ml" if Size else "Unknown Size"
             response.append(f"{name} - {price} ({spirit_type}) by {producer}, {volume}, Age: {Age}, ABV: {ABV}, Size: {Size} - https://baxus.co/asset/{id}")
         await update.message.reply_text("\n".join(response))
-    except sqlite3.Error as e:
+    except psycopg2.Error as e:
         logging.error(f"Database error in filter_by_type: {e}")
         await update.message.reply_text("Error accessing the database. Please try again later.")
     finally:
@@ -450,11 +462,11 @@ async def filter_by_producer(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not producer:
         await update.message.reply_text("Please provide a producer, e.g., /producer Ardbeg")
         return
-    conn = sqlite3.connect('/data/baxus.db')  # CHANGED: Use /data/baxus.db
+    conn = psycopg2.connect(os.getenv("DATABASE_URL"))  # CHANGED: Use Postgres
     c = conn.cursor()
     try:
         c.execute("SELECT name, price, spirit_type, id, producer, volume, Age, ABV, Size FROM listings "
-                  "WHERE lower(producer) LIKE ? LIMIT 5", (f"%{producer}%",))
+                  "WHERE LOWER(producer) LIKE %s LIMIT 5", (f"%{producer}%",))
         listings = c.fetchall()
         logging.debug(f"Fetched {len(listings)} listings for /producer {producer}")
         if not listings:
@@ -472,14 +484,14 @@ async def filter_by_producer(update: Update, context: ContextTypes.DEFAULT_TYPE)
             Size = f"{Size}ml" if Size else "Unknown Size"
             response.append(f"{name} - {price} ({spirit_type}) by {producer}, {volume}, Age: {Age}, ABV: {ABV}, Size: {Size} - https://baxus.co/asset/{id}")
         await update.message.reply_text("\n".join(response))
-    except sqlite3.Error as e:
+    except psycopg2.Error as e:
         logging.error(f"Database error in filter_by_producer: {e}")
         await update.message.reply_text("Error accessing the database. Please try again later.")
     finally:
         conn.close()
 
 async def list_types(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    conn = sqlite3.connect('/data/baxus.db')  # CHANGED: Use /data/baxus.db
+    conn = psycopg2.connect(os.getenv("DATABASE_URL"))  # CHANGED: Use Postgres
     c = conn.cursor()
     try:
         c.execute("SELECT DISTINCT spirit_type FROM listings WHERE spirit_type != '' LIMIT 10")
@@ -490,7 +502,7 @@ async def list_types(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         response = "\n".join([t[0] for t in types])
         await update.message.reply_text(response)
-    except sqlite3.Error as e:
+    except psycopg2.Error as e:
         logging.error(f"Database error in list_types: {e}")
         await update.message.reply_text("Error accessing the database. Please try again later.")
     finally:
@@ -502,7 +514,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     params = await parse_query_with_gemini(query)
     logging.debug(f"Gemini parsed params: {params}")
-    conn = sqlite3.connect('/data/baxus.db')  # CHANGED: Use /data/baxus.db
+    conn = psycopg2.connect(os.getenv("DATABASE_URL"))  # CHANGED: Use Postgres
     c = conn.cursor()
     try:
         sql = "SELECT name, price, spirit_type, id, producer, volume, Age, ABV, Size, attributes FROM listings WHERE 1=1"
@@ -511,43 +523,43 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         order_by = ""
         
         if params['spirit_type']:
-            conditions.append("lower(spirit_type) LIKE ?")
+            conditions.append("LOWER(spirit_type) LIKE %s")
             query_params.append(f"%{params['spirit_type'].lower()}%")
         if params['producer']:
-            conditions.append("lower(producer) LIKE ?")
+            conditions.append("LOWER(producer) LIKE %s")
             query_params.append(f"%{params['producer'].lower()}%")
         if params['Age']:
-            conditions.append("Age = ?")
+            conditions.append("Age = %s")
             query_params.append(params['Age'])
         if params['ABV']:
-            conditions.append("CAST(ABV AS REAL) >= ?")
+            conditions.append("CAST(ABV AS REAL) >= %s")
             query_params.append(float(params['ABV']))
         if params['Size']:
-            conditions.append("Size = ?")
+            conditions.append("Size = %s")
             query_params.append(params['Size'])
         if params['country']:
-            conditions.append("json_extract(attributes, '$.Country') LIKE ?")
+            conditions.append("attributes->>'Country' LIKE %s")
             query_params.append(f"%{params['country']}%")
         if params['region']:
-            conditions.append("json_extract(attributes, '$.Region') LIKE ?")
+            conditions.append("attributes->>'Region' LIKE %s")
             query_params.append(f"%{params['region']}%")
         if params['cask_type']:
-            conditions.append("json_extract(attributes, '$.Cask Type') LIKE ?")
+            conditions.append("attributes->>'Cask Type' LIKE %s")
             query_params.append(f"%{params['cask_type']}%")
         if params['series']:
-            conditions.append("json_extract(attributes, '$.Series') LIKE ?")
+            conditions.append("attributes->>'Series' LIKE %s")
             query_params.append(f"%{params['series']}%")
         if params['year_bottled']:
-            conditions.append("json_extract(attributes, '$.Year Bottled') = ?")
+            conditions.append("attributes->>'Year Bottled' = %s")
             query_params.append(params['year_bottled'])
         if params['year_distilled']:
-            conditions.append("json_extract(attributes, '$.Year Distilled') = ?")
+            conditions.append("attributes->>'Year Distilled' = %s")
             query_params.append(params['year_distilled'])
         if params['query']:
-            conditions.append("(lower(name) LIKE ? OR lower(description) LIKE ?)")
+            conditions.append("(LOWER(name) LIKE %s OR LOWER(description) LIKE %s)")
             query_params.extend([f"%{params['query'].lower()}%", f"%{params['query'].lower()}%"])
         if params['price'] is not None:
-            conditions.append("price <= ?")
+            conditions.append("price <= %s")
             query_params.append(params['price'])
         
         if params['intent'] == 'recommend':
@@ -569,7 +581,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for name, price, spirit_type, id, producer, volume, Age, ABV, Size, attributes in listings
         ]
         
-        genai.configure(api_key=GOOGLE_API_KEY)  # CHANGED: Use environment variable
+        genai.configure(api_key=GOOGLE_API_KEY)
         model = genai.GenerativeModel('gemini-1.5-flash')
         prompt = f"""
         You are a conversational AI for a whiskey marketplace bot, designed to assist users with finding, recommending, and learning about whiskeys. The user asked: "{query}".
@@ -595,7 +607,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         - If intent is 'describe', provide details about the whiskey, producer, or type, using the listings or general knowledge.
         - If intent is 'compare', compare the listed whiskeys by price, Age, ABV, Size, or other attributes.
         - If intent is 'budget_plan', offer combinations that match the budget and quantity.
-        - If intent is 'Range', give a range ( -, between, from, below, above) with details ( name, price, spirit type, producer, volume, ABV, Size, country, region, cask type, series, year bottled, year distilled)
+        - If intent is 'Range', give a range ( -, between, from, below, above) with details (name, price, spirit type, producer, volume, ABV, Size, country, region, cask type, series, year bottled, year distilled)
         - If intent is 'event_recommendation', suggest value-for-money bottles for groups.
         - For any unknown intent, respond helpfully using database knowledge.
         - If intent is 'general' or unclear, Use friendly, knowledgeable tone. Avoid markdown. Keep it natural like a whiskey expert talking to a friend.
@@ -611,7 +623,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logging.error(f"Gemini conversational response error: {e}")
             await update.message.reply_text("Sorry, I couldn't process your request. Try something like 'Recommend a Scotch aged 12 years' or 'Whiskies from Speyside'.")
-    except sqlite3.Error as e:
+    except psycopg2.Error as e:
         logging.error(f"Database error in handle_message: {e}")
         await update.message.reply_text("Error accessing the database. Please try again later.")
     finally:
@@ -629,7 +641,6 @@ def run_scheduler():
         time.sleep(60)
 
 async def main():
-    # CHANGED: Add try-except for robust error handling
     try:
         listings = fetch_listings()
         if listings:
