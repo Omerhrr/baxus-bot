@@ -465,7 +465,7 @@ async def filter_by_producer(update: Update, context: ContextTypes.DEFAULT_TYPE)
             name = name or "Unknown"
             price = f"${price:.2f}" if price is not None else "Price not available"
             spirit_type = spirit_type or "Unknown type"
-            producer Paproducer or "Unknown producer"
+            producer = producer or "Unknown producer"
             volume = volume or "Unknown volume"
             Age = Age or "Unknown Age"
             ABV = f"{ABV}%" if ABV else "Unknown ABV"
