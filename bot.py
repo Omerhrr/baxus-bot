@@ -12,13 +12,23 @@ import asyncio
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
 from telegram import Update
 from telegram.ext import ContextTypes
+from requests.exceptions import HTTPError  # NEW: Added for rate limiting
 
 # Configure logging
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[logging.FileHandler('baxus_scraper.log'), logging.StreamHandler()]
+    handlers=[logging.FileHandler('/data/baxus_scraper.log'), logging.StreamHandler()]  # CHANGED: Log to /data
 )
+
+# NEW: Load environment variables
+TOKEN = os.getenv("TOKEN")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+
+# NEW: Validate environment variables
+if not TOKEN or not GOOGLE_API_KEY:
+    logging.error("Missing TOKEN or GOOGLE_API_KEY environment variables")
+    exit(1)
 
 # Scraper
 BASE_URL = "https://services.baxus.co/api/search/listings"
@@ -40,7 +50,15 @@ def fetch_listings():
         logging.info(f"Fetching listings: {url}")
         try:
             response = requests.get(url, headers=headers, timeout=10)
+            # NEW: Handle rate limiting (HTTP 429)
+            if response.status_code == 429:
+                logging.warning("Rate limit hit, sleeping for 60 seconds")
+                time.sleep(60)
+                response = requests.get(url, headers=headers, timeout=10)
             response.raise_for_status()
+        except HTTPError as e:
+            logging.error(f"HTTP error fetching {url}: {e}")
+            break
         except requests.RequestException as e:
             logging.error(f"Error fetching {url}: {e}")
             break
@@ -105,19 +123,20 @@ def fetch_listings():
         from_idx += size
         time.sleep(1)
 
-    raw_json_file = f"raw_json_{timestamp}.json"
+    # CHANGED: Save JSON files to /data
+    raw_json_file = f"/data/raw_json_{timestamp}.json"
     with open(raw_json_file, 'w', encoding='utf-8') as f:
         json.dump(raw_listings, f, indent=2)
     logging.info(f"Raw JSON saved to {raw_json_file}")
 
-    output_file = f'baxus_listings_{timestamp}.json'
+    output_file = f"/data/baxus_listings_{timestamp}.json"
     with open(output_file, 'w', encoding='utf-8') as f:
         json.dump(all_listings, f, indent=2)
     logging.info(f"Saved {len(all_listings)} listings to {output_file}")
     return all_listings
 
 # Database
-def store_in_db(listings, db_file='baxus.db'):
+def store_in_db(listings, db_file='/data/baxus.db'):  # CHANGED: Default to /data/baxus.db
     conn = sqlite3.connect(db_file)
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS listings (
@@ -146,7 +165,7 @@ def store_in_db(listings, db_file='baxus.db'):
     logging.info(f"Stored {valid_listings} valid listings. Database contains {count} listings.")
     conn.close()
 
-def get_db_summary(db_file='baxus.db'):
+def get_db_summary(db_file='/data/baxus.db'):  # CHANGED: Default to /data/baxus.db
     conn = sqlite3.connect(db_file)
     c = conn.cursor()
     
@@ -199,11 +218,9 @@ def get_db_summary(db_file='baxus.db'):
     return summary
 
 # Bot
-TOKEN = "8019654365:AAE-HlvLRxfRdB2rS5iym26fW8u9qeda4b0"
-os.environ["GOOGLE_API_KEY"] = "AIzaSyBqnaGfXybghXQyjcuKRdpuLRijw95VBHs"
-
+# CHANGED: Use environment variable for Google API key
 async def parse_query_with_gemini(query: str) -> dict:
-    genai.configure(api_key=os.environ["GOOGLE_API_KEY"])
+    genai.configure(api_key=GOOGLE_API_KEY)
     model = genai.GenerativeModel('gemini-1.5-flash')
     prompt = f"""
     Parse the following user query for a whiskey marketplace bot into structured parameters.
@@ -245,7 +262,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def list_listings(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    conn = sqlite3.connect('baxus.db')
+    conn = sqlite3.connect('/data/baxus.db')  # CHANGED: Use /data/baxus.db
     c = conn.cursor()
     try:
         c.execute("SELECT name, price, spirit_type, id, producer, volume, Age, ABV, Size FROM listings ORDER BY RANDOM() LIMIT 5")
@@ -336,7 +353,7 @@ async def search_listings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text_query = ' '.join(text_query.split()) if text_query else ''
 
     try:
-        conn = sqlite3.connect('/mnt/c/Users/HP/desktop/bax/bax/baxus.db')
+        conn = sqlite3.connect('/data/baxus.db')  # CHANGED: Use /data/baxus.db
         c = conn.cursor()
         sql = "SELECT name, price, spirit_type, id, producer, volume, Age, ABV, Size FROM listings WHERE 1=1"
         conditions = []
@@ -394,12 +411,13 @@ async def search_listings(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Error accessing the database. Please try again later.")
     finally:
         conn.close()
+
 async def filter_by_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     spirit_type = " ".join(context.args).lower()
     if not spirit_type:
         await update.message.reply_text("Please provide a spirit type, e.g., /type Whisky")
         return
-    conn = sqlite3.connect('baxus.db')
+    conn = sqlite3.connect('/data/baxus.db')  # CHANGED: Use /data/baxus.db
     c = conn.cursor()
     try:
         c.execute("SELECT name, price, spirit_type, id, producer, volume, Age, ABV, Size FROM listings "
@@ -432,7 +450,7 @@ async def filter_by_producer(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not producer:
         await update.message.reply_text("Please provide a producer, e.g., /producer Ardbeg")
         return
-    conn = sqlite3.connect('baxus.db')
+    conn = sqlite3.connect('/data/baxus.db')  # CHANGED: Use /data/baxus.db
     c = conn.cursor()
     try:
         c.execute("SELECT name, price, spirit_type, id, producer, volume, Age, ABV, Size FROM listings "
@@ -447,7 +465,7 @@ async def filter_by_producer(update: Update, context: ContextTypes.DEFAULT_TYPE)
             name = name or "Unknown"
             price = f"${price:.2f}" if price is not None else "Price not available"
             spirit_type = spirit_type or "Unknown type"
-            producer = producer or "Unknown producer"
+            producer Paproducer or "Unknown producer"
             volume = volume or "Unknown volume"
             Age = Age or "Unknown Age"
             ABV = f"{ABV}%" if ABV else "Unknown ABV"
@@ -461,7 +479,7 @@ async def filter_by_producer(update: Update, context: ContextTypes.DEFAULT_TYPE)
         conn.close()
 
 async def list_types(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    conn = sqlite3.connect('baxus.db')
+    conn = sqlite3.connect('/data/baxus.db')  # CHANGED: Use /data/baxus.db
     c = conn.cursor()
     try:
         c.execute("SELECT DISTINCT spirit_type FROM listings WHERE spirit_type != '' LIMIT 10")
@@ -484,7 +502,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     params = await parse_query_with_gemini(query)
     logging.debug(f"Gemini parsed params: {params}")
-    conn = sqlite3.connect('baxus.db')
+    conn = sqlite3.connect('/data/baxus.db')  # CHANGED: Use /data/baxus.db
     c = conn.cursor()
     try:
         sql = "SELECT name, price, spirit_type, id, producer, volume, Age, ABV, Size, attributes FROM listings WHERE 1=1"
@@ -551,7 +569,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for name, price, spirit_type, id, producer, volume, Age, ABV, Size, attributes in listings
         ]
         
-        genai.configure(api_key=os.environ["GOOGLE_API_KEY"])
+        genai.configure(api_key=GOOGLE_API_KEY)  # CHANGED: Use environment variable
         model = genai.GenerativeModel('gemini-1.5-flash')
         prompt = f"""
         You are a conversational AI for a whiskey marketplace bot, designed to assist users with finding, recommending, and learning about whiskeys. The user asked: "{query}".
@@ -580,7 +598,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         - If intent is 'Range', give a range ( -, between, from, below, above) with details ( name, price, spirit type, producer, volume, ABV, Size, country, region, cask type, series, year bottled, year distilled)
         - If intent is 'event_recommendation', suggest value-for-money bottles for groups.
         - For any unknown intent, respond helpfully using database knowledge.
-        - If intent is 'general' or unclear, Use friendly, knowledgeable tone. Avoid markdown. Keep it natural like a whiskey expert talking to a friend..
+        - If intent is 'general' or unclear, Use friendly, knowledgeable tone. Avoid markdown. Keep it natural like a whiskey expert talking to a friend.
         
         Queryable fields include: name, price, spirit type, producer, volume, Age, ABV (%), Size (ml), country, region, cask type, series, year bottled, year distilled, description, listed date, status, and other attributes (except Blurhash, PackageShot, and image_url).
         If no listings match, suggest alternatives based on the database summary (e.g., popular types or producers).
@@ -611,12 +629,16 @@ def run_scheduler():
         time.sleep(60)
 
 async def main():
-    listings = fetch_listings()
-    if listings:
-        store_in_db(listings)
-        logging.info(f"Initial database population completed with {len(listings)} listings.")
-    else:
-        logging.warning("No listings fetched during initial population.")
+    # CHANGED: Add try-except for robust error handling
+    try:
+        listings = fetch_listings()
+        if listings:
+            store_in_db(listings)
+            logging.info(f"Initial database population completed with {len(listings)} listings.")
+        else:
+            logging.warning("No listings fetched during initial population.")
+    except Exception as e:
+        logging.error(f"Error during initial setup: {e}")
 
     scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
     scheduler_thread.start()
